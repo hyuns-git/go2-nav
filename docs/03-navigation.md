@@ -56,7 +56,8 @@ pkill -f bt_navigator; pkill -f recoveries_server; pkill -f waypoint_follower
 sleep 3
 
 ros2 launch go2_nav_bridge navigation.launch.py \
-  map:=/home/unitree/maps/office.yaml
+  map:=/home/unitree/maps/test2.yaml
+#yaml 파일 이름을 내가 실행시키고 싶은 파일이름으로 수정시킨 후 꼭 실행!!!
 ```
 
 이 런치는 세 가지를 함께 띄웁니다:
