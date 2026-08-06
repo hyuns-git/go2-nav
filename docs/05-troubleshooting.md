@@ -1,6 +1,7 @@
 # 트러블슈팅 — 실제로 겪은 문제와 해결
 
 2026-08-04 구축 과정에서 실제로 막혔던 지점들을 순서대로 기록합니다.
+2026-08-05 계단 등반 모듈 개발 및 지도 확장 과정에서 겪은 문제(12~15)를 추가했습니다.
 
 ---
 
@@ -115,6 +116,8 @@ MobaXterm 탭에 이름을 붙여 어느 탭에서 뭘 돌렸는지 관리하세
 
 → **`Transient Local`로 변경**
 
+(렌더링 자체가 깨지는 경우는 문제12 참고 — 이것과는 다른 원인입니다.)
+
 ---
 
 ## 문제 5 — `map_server` configure 실패
@@ -161,7 +164,7 @@ amcl                   active [3]
 controller_server      active [3]
 planner_server         무응답
 recoveries_server      inactive [2]
-bt_navigator           inactive [2]
+bt_navigator            inactive [2]
 ```
 
 **로그**
@@ -196,6 +199,10 @@ timeout 10 ros2 lifecycle set /bt_navigator activate
 > 2D Pose Estimate를 못 찍는 딜레마가 있습니다. 그래서 명령으로
 > 먼저 TF를 만들고, 그 다음 RViz에서 정밀하게 다시 찍습니다.
 
+**주의 (문제13과 연결)**: `--once`가 discovery 타이밍 때문에 씹히는 경우가
+있습니다. 반복 발행으로 바꿀 때는 **반드시 이 pub을 실행한 바로 그 터미널에서만**
+Ctrl+C 하세요. Nav2를 띄운 터미널에서 잘못 Ctrl+C 하면 스택 전체가 죽습니다.
+
 ---
 
 ## 문제 7 — 맵이 흐릿하고 벽이 흩뿌려진 점으로 나온다
@@ -213,6 +220,11 @@ timeout 10 ros2 lifecycle set /bt_navigator activate
 벽에 닿는 점이 전체의 5% 미만입니다.
 
 같은 파라미터로 주행만 바꿔 재측정한 결과: 흩뿌려진 점 → **벽 이웃수 2.51**
+
+**실사례 (2026-08-05)**: 사무실만 재주행했는데 이웃수 4.66이 나온 적이 있음.
+`pkill` 정리 누락, `/scan` hz 저하, RViz로 실시간 확인 없이 다 걷고 나서야
+결과를 본 것이 원인으로 의심됨. 걷는 동안 RViz를 계속 띄워놓고 벽이 두 겹으로
+갈라지는 순간 바로 멈춰서 되돌아가 재스캔하는 것이 사후 확인보다 훨씬 빠르다.
 
 ---
 
@@ -273,11 +285,130 @@ python3 -m py_compile ~/go2_tools/파일.py && echo OK
 
 ---
 
+## 문제 12 — RViz에서 Map이 안 그려짐 (GLSL 에러)
+
+```
+[ERROR] rviz2: Vertex Program:rviz/glsl120/indexed_8bit_image.vert
+Fragment Program:rviz/glsl120/indexed_8bit_image.frag GLSL link result:
+active samplers with a different type refer to the same texture image unit
+```
+
+**원인**: MobaXterm/X11 원격 디스플레이의 구형 GPU 드라이버(OpenGL 3.1,
+GLSL 1.4)가 Map 디스플레이가 쓰는 8bit indexed 텍스처 셰이더와 호환되지
+않습니다. LaserScan 등은 정상 렌더링되지만 점유격자 이미지만 안 그려질 수
+있습니다. 이 상태에서 "빨간 점을 벽선에 맞추라"는 작업 자체가 눈으로
+불가능하니, Map이 실제로 그려지는지부터 확인하세요.
+
+**해결** — 소프트웨어 렌더링 강제:
+```bash
+export LIBGL_ALWAYS_SOFTWARE=1
+rviz2
+```
+속도는 느려지지만 이 셰이더 충돌을 우회하는 가장 확실한 방법입니다.
+
+---
+
+## 문제 13 — `/initialpose`가 계속 (0,0,0)으로 리셋된다
+
+**증상**: 2D Pose Estimate로 제대로 맞춰도 1초 뒤 다시 어긋남.
+AMCL 로그에 `initialPoseReceived`가 1초 간격으로 계속 찍힘.
+
+**원인**: 부트스트랩용으로 반복 발행했던
+`ros2 topic pub /initialpose ...`(--once 없이 실행한 것)를 Ctrl+C로
+멈추지 않고 다른 작업으로 넘어감. 이 프로세스가 백그라운드에 남아
+1초마다 예전 값을 계속 재발행하면서, 방금 맞춘 정확한 위치를 덮어씀.
+
+**확인**
+```bash
+ps aux | grep "topic pub" | grep -v grep
+```
+
+**해결**
+```bash
+pkill -f "topic pub"
+```
+그다음 초기 위치를 다시 맞춥니다. **명령줄로 반복 발행하는 방식은 되도록
+피하고, RViz의 2D Pose Estimate(클릭 한 번으로 끝나고 백그라운드에
+아무것도 안 남음)를 우선 사용하세요.**
+
+---
+
+## 문제 14 — AMCL 위치추정이 계속 발산한다 (제자리 회전 시 특히)
+
+**증상**: 전역 위치 재탐색(`/reinitialize_global_localization`) 후 회전시켜도
+입자가 수렴하지 않거나, 수렴한 것처럼 보여도 스캔이 벽과 안 맞음(확신은
+있는데 틀린 위치로 오수렴).
+
+**원인**: Go2는 다리로 걷기 때문에 제자리에서 빠르게 회전할 때 다리 미끄러짐으로
+오도메트리 오차가 커집니다. AMCL의 `alpha1~4`(모션 노이즈 파라미터)가
+0.30으로 다소 높게 잡혀 있어(바퀴 로봇 대비 보정한 값), 빠른 회전 시 입자가
+과도하게 퍼지거나 엉뚱하게 수렴할 수 있습니다.
+
+**해결 순서**
+```bash
+# 1) 모션 노이즈를 낮춰서 재시작 없이 시도
+ros2 param set /amcl alpha1 0.15
+ros2 param set /amcl alpha2 0.15
+ros2 param set /amcl alpha3 0.15
+ros2 param set /amcl alpha4 0.15
+
+# 2) 전역 재탐색
+ros2 service call /reinitialize_global_localization std_srvs/srv/Empty
+```
+
+그다음:
+- **360도씩 한 번에 돌리지 말고 30~45도씩 끊어서, 매번 3~5초 정지하며
+  `/particlecloud`(PoseArray, Arrow Length를 1.0 이상으로 키워서 확인)가
+  좁아지는지 관찰**
+- **제자리 회전보다 짧은 직진(1~2m)이 이 로봇에서는 더 안정적으로 수렴하는
+  경우가 많음** — 회전으로 안 되면 직진으로 전환
+- 로봇의 실제 위치를 어느 정도 알고 있다면(매핑 시작 지점, 이미 등록된
+  waypoint 등) 위치(x,y) 공분산은 좁게, yaw 공분산만 크게(예: 6.85) 줘서
+  "위치는 확신, 방향만 탐색"하게 만들면 훨씬 빨리 수렴함
+
+**판정 기준**: 빨간 스캔점이 검은 벽선과 5cm 이내로 겹치고, PoseArray
+화살표들이 흩어지지 않고 한 방향으로 뭉쳐 있어야 함.
+
+---
+
+## 문제 15 — 빌드했는데 새 실행파일(`ros2 run`)이 안 보인다
+
+```
+ros2 run go2_nav_bridge waypoint_tool save stair_entry
+No executable found
+```
+
+**원인**: `setup.py`의 `entry_points`에는 등록되어 있는데, 워크스페이스
+소스(`~/ros2_ws/src/go2_nav_bridge`)가 최신 코드와 동기화가 안 됐거나,
+colcon 빌드 캐시가 꼬여서 새 스크립트가 반영 안 됨.
+
+**확인**
+```bash
+ls ~/ros2_ws/src/go2_nav_bridge/go2_nav_bridge/
+cat ~/ros2_ws/src/go2_nav_bridge/setup.py | grep -A6 entry_points
+```
+
+**해결** — 해당 패키지만 클린 빌드
+```bash
+cd ~/ros2_ws
+rm -rf build/go2_nav_bridge install/go2_nav_bridge log/latest_build/go2_nav_bridge
+colcon build --packages-select go2_nav_bridge --symlink-install
+source install/setup.bash
+ros2 pkg executables go2_nav_bridge
+```
+
+**주의**: 빌드는 그 터미널에만 반영됩니다. **다른 터미널도 전부**
+`source ~/ros2_ws/install/setup.bash`를 다시 해야 새 실행파일을 인식합니다
+(문제 1과 같은 원인).
+
+---
+
 ## 응급 정지
 
 1. 조종기 **L2+A**(기립) 또는 **L2+B**(엎드림)
 2. 전원 버튼 길게
 3. ROS: `pkill -f cmd_vel_bridge` (종료 시 STOPMOVE 자동 발행)
+4. 계단 등반 중이면: `stair_traverse_node`를 Ctrl+C — 종료 시 Move(0,0,0) → StopMove 발행됨
 
 ---
 
@@ -288,6 +419,7 @@ pkill -f slam_toolbox; pkill -f scan_maker; pkill -f cmd_vel_bridge
 pkill -f nav2; pkill -f map_server; pkill -f amcl
 pkill -f controller_server; pkill -f planner_server
 pkill -f bt_navigator; pkill -f recoveries_server; pkill -f waypoint_follower
+pkill -f "topic pub"; pkill -f stair_traverse_node
 sleep 3
 ros2 daemon stop && ros2 daemon start
 sleep 2
@@ -305,4 +437,5 @@ ls -t ~/.ros/log/ | head -5
 # 특정 노드 로그 (파일 자체이므로 tail 직접)
 ls -t ~/.ros/log/planner_server_*.log | head -1 | xargs tail -50
 ls -t ~/.ros/log/map_server_*.log | head -1 | xargs tail -50
+ls -t ~/.ros/log/amcl_*.log | head -1 | xargs tail -50
 ```

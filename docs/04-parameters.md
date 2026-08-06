@@ -86,13 +86,21 @@
 
 | 파라미터 | 기본 | 설정 | 근거 |
 |---|---|---|---|
-| `alpha1~4` | 0.2 | **0.30** | 보행 로봇 오도메트리 노이즈가 바퀴보다 큼 |
+| `alpha1~4` | 0.2 | **0.30** (제자리 회전 발산 시 0.15로 하향 검토) | 보행 로봇 오도메트리 노이즈가 바퀴보다 큼. 단, 너무 높으면 제자리 회전 시 입자가 과도하게 퍼지거나 오수렴함 ([05-troubleshooting.md](05-troubleshooting.md) 문제14) |
 | `min_particles` | 500 | **800** | 스캔이 희박(유효 93빔)해 입자를 늘려야 수렴 |
 | `max_particles` | 2000 | **3000** | 위와 동일 |
 | `max_beams` | 60 | **120** | 180빔 중 120 사용. 희박한 스캔에서 60은 부족 |
 | `laser_max_range` | 100.0 | **10.0** | 실측 범위 |
 | `laser_min_range` | -1.0 | **0.30** | 자기 몸통 제거 |
 | `laser_model_type` | — | `likelihood_field` | 표준 |
+
+**전역 재초기화**: 초기 위치를 손으로 못 맞추겠거나 계속 오수렴하면,
+수동 클릭 대신 아래로 입자를 지도 전체에 재분산시키고 천천히 움직여서
+스캔 매칭으로 수렴시키는 게 더 안정적입니다.
+```bash
+ros2 service call /reinitialize_global_localization std_srvs/srv/Empty
+```
+자세한 절차는 [05-troubleshooting.md](05-troubleshooting.md) 문제14 참조.
 
 ### Controller (DWB)
 
@@ -160,7 +168,7 @@
 | 벽이 두 겹 | `loop_search_maximum_distance` 6 → 8 |
 | 맵이 갑자기 찌그러짐 | `loop_match_minimum_response_fine` 0.45 → 0.55 |
 | 바닥이 장애물로 잡힘 | `min_height` 상향 |
-| 위치가 튐 | AMCL `alpha1~4` 하향 |
+| 위치가 튐 / 제자리 회전 시 발산 | AMCL `alpha1~4` 하향(0.30→0.15) + `/reinitialize_global_localization` 후 소각도 분할 회전 또는 직진으로 수렴 |
 | 안 움직임 | bridge `min_vx` 상향 |
 | 좌우 진동 | DWB `PathAlign.scale` 하향, `sim_time` 상향 |
 | 좁은 문 못 감 | `inflation_radius` 0.45 → 0.35 |
@@ -169,6 +177,8 @@
 | 경로 없음 | `allow_unknown: true`, planner `tolerance` 상향 |
 | CPU 100% | costmap 축소, `max_particles` 하향, async 전환 |
 | recovery 남발 | `movement_time_allowance` 상향 + 근본원인 조사 |
+| RViz에 Map이 안 그려짐 | `LIBGL_ALWAYS_SOFTWARE=1` 후 rviz2 재실행 ([05-troubleshooting.md](05-troubleshooting.md) 문제12) |
+| 계단 중간에서 회전 시도(위험) | `stair_traverse_node`의 `min_climb_margin` 상향, `seconds_per_step` 재보정 |
 
 ---
 
@@ -199,3 +209,27 @@ ros2 param set /local_costmap/local_costmap inflation_layer.inflation_radius 0.3
   결과: 1회 __ / 2회 __ / 3회 __
   판정: 개선 / 악화 / 무변화
 ```
+
+---
+
+## 8. stair_traverse_node
+
+계단 등반 자체(발 위치, 균형)는 Go2 내장 `ClassicWalk` 게이트가 처리하므로
+튜닝 대상이 아닙니다. 아래 파라미터는 "지금 어느 구간(오름/착지참 회전)에
+있는지"를 판단하는 오케스트레이션 레이어의 값입니다. 자세한 설명은
+[07-stair-crossing.md](07-stair-crossing.md) 참조.
+
+| 파라미터 | 기본값 | 근거 |
+|---|---|---|
+| `flight_step_counts` | `[9, 5]` | 실측 계단 구조 (9단 → 착지참 → 5단) |
+| `turn_angles_deg` | `[180.0]` | 착지참 유턴 각도. 길이는 `flight_step_counts`길이-1 |
+| `turn_direction` | 1.0 | +1=반시계, -1=시계. 실제 착지참 유턴 방향에 맞출 것 |
+| `forward_speed` | 0.25 (m/s) | 계단 전용 저속 |
+| `turn_speed` | 0.4 (rad/s) | 착지참 회전 속도 |
+| `seconds_per_step` | 1.2 | **실측 필요** — 컨트롤러 수동 등반 시 `/utlidar/robot_odom` 로그에서 flight별 소요시간 ÷ 단수로 산출 |
+| `pitch_climb_deg` | 8.0 | 이 이상이면 "오르는 중"으로 판단. 실측 pitch 최대값보다 살짝 낮게 |
+| `pitch_level_deg` | 3.0 | 이 이하로 복귀하면 "평지 후보" |
+| `level_hold_sec` | 2.0 | 평지 상태 유지 시간 — 착지참에서의 오탐 방지 |
+| `min_climb_margin` | 0.5 | `steps * seconds_per_step * margin` 이전에는 종료 판정 안 함. 너무 낮으면 계단 중간에 회전 시도(낙상 위험) |
+| `turn_tolerance_deg` | 5.0 | 회전 목표 각도 허용오차 |
+| `max_duration_sec` | 90.0 | 전체 시퀀스 안전 타임아웃 |
